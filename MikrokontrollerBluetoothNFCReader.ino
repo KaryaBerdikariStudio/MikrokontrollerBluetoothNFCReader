@@ -6,13 +6,13 @@
 #include <HTTPClient.h>
 #include <SPI.h>
 #include <MFRC522.h>
-#include <ESPmDNS.h>
+#include <WiFiUdp.h>  // Added for UDP broadcast
 
 // ----------------------------
 // RFID Configuration
 // ----------------------------
-#define RFID_SS_PIN    5     // SDA/SS Pin for RFID
-#define RFID_RST_PIN   22    // RST Pin for RFID
+#define RFID_SS_PIN 5    // SDA/SS Pin for RFID
+#define RFID_RST_PIN 22  // RST Pin for RFID
 MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
 
 // ----------------------------
@@ -23,15 +23,15 @@ Preferences preferences;
 // ----------------------------
 // Global Variables & Provisioning Configuration
 // ----------------------------
-String savedSSID = "";          // Wi-Fi SSID (empty means not provisioned)
-String savedPassword = "";      // Wi-Fi Password
+String savedSSID = "";      // Wi-Fi SSID (empty means not provisioned)
+String savedPassword = "";  // Wi-Fi Password
 
 // AP and captive portal settings
 const char *provisionSSID = "ESP32_Provision";
 const char *provisionPassword = "12345678";
 
 // Custom captive portal domain
-const char* customDomain = "myportal.local";
+const char *customDomain = "myportal.local";
 
 // DNS Server for captive portal
 const byte DNS_PORT = 53;
@@ -40,11 +40,10 @@ DNSServer dnsServer;
 // Async Web Server on port 80
 AsyncWebServer webServer(80);
 
-// Backend fallback URL (if mDNS discovery fails)
-const char* fallbackServerURL = "http://192.168.1.36:8000/input-log/";
-// Backend mDNS hostname
-const char* serverMDNS = "esp-server.local";
-String serverURL = "";          // Will be set via mDNS
+// Backend fallback URL (used when UDP discovery fails)
+const char *fallbackServerURL = "http://192.168.1.42:8000/input-log/";
+// Global server URL variable (will be set via UDP discovery)
+String serverURL = fallbackServerURL;
 
 // Wi-Fi scan results
 #define MAX_NETWORKS 20
@@ -195,11 +194,11 @@ void handleSave(AsyncWebServerRequest *request) {
   if (request->hasParam("ssid", true) && request->hasParam("password", true)) {
     String newSSID = request->getParam("ssid", true)->value();
     String newPassword = request->getParam("password", true)->value();
-    
+
     saveCredentials(newSSID, newPassword);
     savedSSID = newSSID;
     savedPassword = newPassword;
-    
+
     Serial.println("\n🔄 Received Credentials:");
     Serial.println("SSID: " + savedSSID);
     Serial.println("Password: " + savedPassword);
@@ -218,24 +217,63 @@ void startProvisioning() {
   Serial.println("\n🚀 Starting Provisioning Mode (AP Mode)...");
   WiFi.mode(WIFI_AP);
   WiFi.softAP(provisionSSID, provisionPassword);
-  
+
   Serial.print("📡 AP IP Address: ");
   Serial.println(WiFi.softAPIP());
-  
+
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
   Serial.printf("✅ DNS Server started for domain '%s'\n", customDomain);
-  
+
   scanWiFiNetworks();
-  
+
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
-  webServer.onNotFound([](AsyncWebServerRequest *request){
+  webServer.onNotFound([](AsyncWebServerRequest *request) {
     request->send(200, "text/html", buildLandingPage());
   });
-  
+
   webServer.begin();
   Serial.println("✅ Provisioning Web Server Started!");
   Serial.printf("👉 Please visit http://%s in your browser\n", customDomain);
+}
+
+// ----------------------------
+// UDP Discovery: Broadcast to Find Backend Server
+// ----------------------------
+void discoverBackendUDP() {
+  WiFiUDP udp;
+  const unsigned int localUdpPort = 4210;    // Local port to listen on
+  const char* broadcastAddress = "255.255.255.255";
+  const unsigned int serverUdpPort = 4211;     // UDP port on which backend listens
+  udp.begin(localUdpPort);
+  
+  Serial.println("📡 Broadcasting UDP message for backend discovery...");
+  udp.beginPacket(broadcastAddress, serverUdpPort);
+  udp.print("DISCOVER_SERVER");
+  udp.endPacket();
+
+  unsigned long startTime = millis();
+  bool responseReceived = false;
+  while (millis() - startTime < 3000) { // Wait up to 3 seconds
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+      char incomingPacket[255];
+      int len = udp.read(incomingPacket, 255);
+      if (len > 0) {
+        incomingPacket[len] = 0; // Null-terminate the string
+      }
+      String discoveredIP = String(incomingPacket);
+      Serial.print("✅ Discovered backend IP via UDP: ");
+      Serial.println(discoveredIP);
+      serverURL = "http://" + discoveredIP + ":8000/input-log/";
+      responseReceived = true;
+      break;
+    }
+  }
+  if (!responseReceived) {
+    Serial.println("⚠️ No UDP response received. Using fallback URL.");
+    serverURL = fallbackServerURL;
+  }
 }
 
 // ----------------------------
@@ -246,7 +284,7 @@ bool connectToWiFi() {
   Serial.println(savedSSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
-  
+
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 10) {
     delay(1000);
@@ -273,29 +311,6 @@ bool connectToWiFi() {
 }
 
 // ----------------------------
-// mDNS Setup: Discover Backend Server
-// ----------------------------
-void setupMDNS() {
-  if (MDNS.begin("esp32")) {
-    Serial.println("✅ ESP32 mDNS responder started as esp32.local");
-  } else {
-    Serial.println("❌ Error setting up mDNS responder.");
-  }
-  
-  Serial.print("🔍 Querying for backend server via mDNS: ");
-  Serial.println(serverMDNS);
-  IPAddress serverIP = MDNS.queryHost(serverMDNS, 2000);
-  if (serverIP) {
-    Serial.print("✅ Found backend server IP: ");
-    Serial.println(serverIP);
-    serverURL = "http://" + serverIP.toString() + ":8000/input-log/";
-  } else {
-    Serial.println("❌ Backend server not found via mDNS.");
-    
-  }
-}
-
-// ----------------------------
 // RFID Functions
 // ----------------------------
 void initRFID() {
@@ -308,41 +323,40 @@ void initRFID() {
 String readRFID() {
   if (!mfrc522.PICC_IsNewCardPresent()) return "";
   if (!mfrc522.PICC_ReadCardSerial()) return "";
-  
+
   String uidStr = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     uidStr += String(mfrc522.uid.uidByte[i], HEX);
   }
   uidStr.toUpperCase();
-  
+
   mfrc522.PICC_HaltA();
-  
+
   Serial.println("✅ RFID Detected! UID: " + uidStr);
   blinkLED(LED_READY, 200);
   beepBuzzer(200);
   vibrate(300);
-  
+
   return uidStr;
 }
 
 // ----------------------------
-// Function to Send RFID Data to Backend (Disabled)
+// Function to Send RFID Data to Backend
 // ----------------------------
 void sendRFIDData(String uid) {
-  
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠️ Wi-Fi disconnected, can't send data!");
     return;
   }
-  
+
   HTTPClient http;
   String fullURL = serverURL + WiFi.localIP().toString() + "/" + uid;
   Serial.print("📡 Sending request to: ");
   Serial.println(fullURL);
-  
+
   http.begin(fullURL);
   int httpResponseCode = http.GET();
-  
+
   if (httpResponseCode > 0) {
     Serial.print("✅ Server Response: ");
     Serial.println(http.getString());
@@ -351,7 +365,6 @@ void sendRFIDData(String uid) {
     Serial.println(httpResponseCode);
   }
   http.end();
-  
 }
 
 // ----------------------------
@@ -360,7 +373,7 @@ void sendRFIDData(String uid) {
 void checkSerialCommand() {
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
-    command.trim(); // Remove extra whitespace/newlines
+    command.trim();  // Remove extra whitespace/newlines
     if (command.equalsIgnoreCase("clear")) {
       Serial.println("Clearing Wi-Fi credentials...");
       preferences.begin("wifi", false);
@@ -382,13 +395,14 @@ void setup() {
   initRFID();
   loadCredentials();
   testRFIDGPIO();
-  
+
   // If no credentials are saved, start provisioning mode.
   if (savedSSID == "") {
     startProvisioning();
   } else {
     if (connectToWiFi()) {
-      setupMDNS();
+      // Use UDP discovery to determine backend server's IP
+      discoverBackendUDP();
       digitalWrite(LED_READY, HIGH);
     }
   }
@@ -397,13 +411,13 @@ void setup() {
 void loop() {
   // Always check for serial commands
   checkSerialCommand();
-  
+
   // If in AP mode (provisioning), process DNS requests.
   if (WiFi.getMode() == WIFI_AP) {
     dnsServer.processNextRequest();
     return;
   }
-  
+
   // Non-blocking reconnection: if WiFi is disconnected, check every 1 minute.
   static unsigned long lastReconnectTime = 0;
   if (WiFi.status() != WL_CONNECTED) {
@@ -416,17 +430,16 @@ void loop() {
     }
     return;
   }
-  
+
   // Normal Operation: Scan for RFID card.
   String uid = readRFID();
   if (uid == "" || uid == lastUID) return;
-  
+
   lastUID = uid;
   Serial.println("🔄 New Card Detected! UID: " + uid);
-  
-  // Data transfer is disabled; uncomment to enable backend communication.
-  // sendRFIDData(uid);
-  
+
+  sendRFIDData(uid);
+
   // Also check serial commands periodically.
   checkSerialCommand();
 }
